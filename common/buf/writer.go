@@ -2,29 +2,49 @@ package buf
 
 import (
 	"io"
+	"net"
 
+	"v2ray.com/core/common"
 	"v2ray.com/core/common/errors"
 )
 
 // BufferToBytesWriter is a Writer that writes alloc.Buffer into underlying writer.
 type BufferToBytesWriter struct {
 	io.Writer
-}
 
-// NewBufferToBytesWriter returns a new BufferToBytesWriter.
-func NewBufferToBytesWriter(writer io.Writer) *BufferToBytesWriter {
-	return &BufferToBytesWriter{
-		Writer: writer,
-	}
+	cache [][]byte
 }
 
 // WriteMultiBuffer implements Writer. This method takes ownership of the given buffer.
 func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
 	defer mb.Release()
 
-	bs := mb.ToNetBuffers()
-	_, err := bs.WriteTo(w.Writer)
-	return err
+	size := mb.Len()
+	if size == 0 {
+		return nil
+	}
+
+	if len(mb) == 1 {
+		return WriteAllBytes(w.Writer, mb[0].Bytes())
+	}
+
+	bs := w.cache
+	for _, b := range mb {
+		bs = append(bs, b.Bytes())
+	}
+	w.cache = bs[:0]
+
+	nb := net.Buffers(bs)
+
+	for size > 0 {
+		n, err := nb.WriteTo(w.Writer)
+		if err != nil {
+			return err
+		}
+		size -= int32(n)
+	}
+
+	return nil
 }
 
 // ReadFrom implements io.ReaderFrom.
@@ -52,8 +72,7 @@ func NewBufferedWriter(writer Writer) *BufferedWriter {
 
 // WriteByte implements io.ByteWriter.
 func (w *BufferedWriter) WriteByte(c byte) error {
-	_, err := w.Write([]byte{c})
-	return err
+	return common.Error2(w.Write([]byte{c}))
 }
 
 // Write implements io.Writer.
@@ -113,14 +132,20 @@ func (w *BufferedWriter) WriteMultiBuffer(b MultiBuffer) error {
 
 // Flush flushes buffered content into underlying writer.
 func (w *BufferedWriter) Flush() error {
-	if !w.buffer.IsEmpty() {
-		if err := w.writer.WriteMultiBuffer(NewMultiBufferValue(w.buffer)); err != nil {
-			return err
-		}
-
-		w.buffer = nil
+	if w.buffer.IsEmpty() {
+		return nil
 	}
-	return nil
+
+	b := w.buffer
+	w.buffer = nil
+
+	if writer, ok := w.writer.(io.Writer); ok {
+		err := WriteAllBytes(writer, b.Bytes())
+		b.Release()
+		return err
+	}
+
+	return w.writer.WriteMultiBuffer(NewMultiBufferValue(b))
 }
 
 // SetBuffered sets whether the internal buffer is used. If set to false, Flush() will be called to clear the buffer.
@@ -143,18 +168,25 @@ func (w *BufferedWriter) ReadFrom(reader io.Reader) (int64, error) {
 	return sc.Size, err
 }
 
-type seqWriter struct {
-	writer io.Writer
+// Close implements io.Closable.
+func (w *BufferedWriter) Close() error {
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	return common.Close(w.writer)
 }
 
-func (w *seqWriter) WriteMultiBuffer(mb MultiBuffer) error {
+// SequentialWriter is a Writer that writes MultiBuffer sequentially into the underlying io.Writer.
+type SequentialWriter struct {
+	io.Writer
+}
+
+// WriteMultiBuffer implements Writer.
+func (w *SequentialWriter) WriteMultiBuffer(mb MultiBuffer) error {
 	defer mb.Release()
 
 	for _, b := range mb {
-		if b.IsEmpty() {
-			continue
-		}
-		if _, err := w.writer.Write(b.Bytes()); err != nil {
+		if err := WriteAllBytes(w.Writer, b.Bytes()); err != nil {
 			return err
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/net"
 	http_proto "v2ray.com/core/common/protocol/http"
@@ -114,5 +115,5 @@ func (ln *Listener) Close() error {
 }
 
 func init() {
-	common.Must(internet.RegisterTransportListener(internet.TransportProtocol_WebSocket, ListenWS))
+	common.Must(internet.RegisterTransportListener(protocolName, ListenWS))
 }

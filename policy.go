@@ -1,10 +1,13 @@
 package core
 
 import (
+	"context"
+	"runtime"
 	"sync"
 	"time"
 
 	"v2ray.com/core/common"
+	"v2ray.com/core/common/platform"
 )
 
 // TimeoutPolicy contains limits for connection timeout.
@@ -27,10 +30,31 @@ type StatsPolicy struct {
 	UserDownlink bool
 }
 
+// BufferPolicy contains settings for internal buffer.
+type BufferPolicy struct {
+	// Size of buffer per connection, in bytes. -1 for unlimited buffer.
+	PerConnection int32
+}
+
+// SystemStatsPolicy contains stat policy settings on system level.
+type SystemStatsPolicy struct {
+	// Whether or not to enable stat counter for uplink traffic in inbound handlers.
+	InboundUplink bool
+	// Whether or not to enable stat counter for downlink traffic in inbound handlers.
+	InboundDownlink bool
+}
+
+// SystemPolicy contains policy settings at system level.
+type SystemPolicy struct {
+	Stats  SystemStatsPolicy
+	Buffer BufferPolicy
+}
+
 // Policy is session based settings for controlling V2Ray requests. It contains various settings (or limits) that may differ for different users in the context.
 type Policy struct {
 	Timeouts TimeoutPolicy // Timeout settings
 	Stats    StatsPolicy
+	Buffer   BufferPolicy
 }
 
 // PolicyManager is a feature that provides Policy for the given user by its id or level.
@@ -39,6 +63,40 @@ type PolicyManager interface {
 
 	// ForLevel returns the Policy for the given user level.
 	ForLevel(level uint32) Policy
+
+	// ForSystem returns the Policy for V2Ray system.
+	ForSystem() SystemPolicy
+}
+
+var defaultBufferSize int32
+
+func init() {
+	const key = "v2ray.ray.buffer.size"
+	const defaultValue = -17
+	size := platform.EnvFlag{
+		Name:    key,
+		AltName: platform.NormalizeEnvName(key),
+	}.GetValueAsInt(defaultValue)
+
+	switch size {
+	case 0:
+		defaultBufferSize = -1 // For pipe to use unlimited size
+	case defaultValue: // Env flag not defined. Use default values per CPU-arch.
+		switch runtime.GOARCH {
+		case "arm", "arm64", "mips", "mipsle", "mips64", "mips64le":
+			defaultBufferSize = 16 * 1024 // 16k cache for low-end devices
+		default:
+			defaultBufferSize = 2 * 1024 * 1024
+		}
+	default:
+		defaultBufferSize = int32(size) * 1024 * 1024
+	}
+}
+
+func defaultBufferPolicy() BufferPolicy {
+	return BufferPolicy{
+		PerConnection: defaultBufferSize,
+	}
 }
 
 // DefaultPolicy returns the Policy when user is not specified.
@@ -47,14 +105,33 @@ func DefaultPolicy() Policy {
 		Timeouts: TimeoutPolicy{
 			Handshake:      time.Second * 4,
 			ConnectionIdle: time.Second * 300,
-			UplinkOnly:     time.Second * 5,
-			DownlinkOnly:   time.Second * 30,
+			UplinkOnly:     time.Second * 2,
+			DownlinkOnly:   time.Second * 5,
 		},
 		Stats: StatsPolicy{
 			UserUplink:   false,
 			UserDownlink: false,
 		},
+		Buffer: defaultBufferPolicy(),
 	}
+}
+
+type policyKey int
+
+const (
+	bufferPolicyKey policyKey = 0
+)
+
+func ContextWithBufferPolicy(ctx context.Context, p BufferPolicy) context.Context {
+	return context.WithValue(ctx, bufferPolicyKey, p)
+}
+
+func BufferPolicyFromContext(ctx context.Context) BufferPolicy {
+	pPolicy := ctx.Value(bufferPolicyKey)
+	if pPolicy == nil {
+		return defaultBufferPolicy()
+	}
+	return pPolicy.(BufferPolicy)
 }
 
 type syncPolicyManager struct {
@@ -75,6 +152,17 @@ func (m *syncPolicyManager) ForLevel(level uint32) Policy {
 	}
 
 	return m.PolicyManager.ForLevel(level)
+}
+
+func (m *syncPolicyManager) ForSystem() SystemPolicy {
+	m.RLock()
+	defer m.RUnlock()
+
+	if m.PolicyManager == nil {
+		return SystemPolicy{}
+	}
+
+	return m.PolicyManager.ForSystem()
 }
 
 func (m *syncPolicyManager) Start() error {
@@ -103,6 +191,6 @@ func (m *syncPolicyManager) Set(manager PolicyManager) {
 	m.Lock()
 	defer m.Unlock()
 
-	common.Close(m.PolicyManager)
+	common.Close(m.PolicyManager) // nolint: errcheck
 	m.PolicyManager = manager
 }

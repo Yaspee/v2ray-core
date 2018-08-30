@@ -3,13 +3,39 @@ package inbound
 import (
 	"context"
 
+	"v2ray.com/core"
 	"v2ray.com/core/app/proxyman"
 	"v2ray.com/core/app/proxyman/mux"
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/dice"
 	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/serial"
 	"v2ray.com/core/proxy"
 )
+
+func getStatCounter(v *core.Instance, tag string) (core.StatCounter, core.StatCounter) {
+	var uplinkCounter core.StatCounter
+	var downlinkCounter core.StatCounter
+
+	policy := v.PolicyManager()
+	stats := v.Stats()
+	if len(tag) > 0 && policy.ForSystem().Stats.InboundUplink {
+		name := "inbound>>>" + tag + ">>>traffic>>>uplink"
+		c, _ := core.GetOrRegisterStatCounter(stats, name)
+		if c != nil {
+			uplinkCounter = c
+		}
+	}
+	if len(tag) > 0 && policy.ForSystem().Stats.InboundDownlink {
+		name := "inbound>>>" + tag + ">>>traffic>>>downlink"
+		c, _ := core.GetOrRegisterStatCounter(stats, name)
+		if c != nil {
+			downlinkCounter = c
+		}
+	}
+
+	return uplinkCounter, downlinkCounter
+}
 
 type AlwaysOnInboundHandler struct {
 	proxy   proxy.Inbound
@@ -34,6 +60,8 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 		tag:   tag,
 	}
 
+	uplinkCounter, downlinkCounter := getStatCounter(core.MustFromContext(ctx), tag)
+
 	nl := p.Network()
 	pr := receiverConfig.PortRange
 	address := receiverConfig.Listen.AsAddress()
@@ -44,26 +72,30 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 		if nl.HasNetwork(net.Network_TCP) {
 			newError("creating stream worker on ", address, ":", port).AtDebug().WriteToLog()
 			worker := &tcpWorker{
-				address:      address,
-				port:         net.Port(port),
-				proxy:        p,
-				stream:       receiverConfig.StreamSettings,
-				recvOrigDest: receiverConfig.ReceiveOriginalDestination,
-				tag:          tag,
-				dispatcher:   h.mux,
-				sniffers:     receiverConfig.DomainOverride,
+				address:         address,
+				port:            net.Port(port),
+				proxy:           p,
+				stream:          receiverConfig.StreamSettings,
+				recvOrigDest:    receiverConfig.ReceiveOriginalDestination,
+				tag:             tag,
+				dispatcher:      h.mux,
+				sniffingConfig:  receiverConfig.GetEffectiveSniffingSettings(),
+				uplinkCounter:   uplinkCounter,
+				downlinkCounter: downlinkCounter,
 			}
 			h.workers = append(h.workers, worker)
 		}
 
 		if nl.HasNetwork(net.Network_UDP) {
 			worker := &udpWorker{
-				tag:          tag,
-				proxy:        p,
-				address:      address,
-				port:         net.Port(port),
-				recvOrigDest: receiverConfig.ReceiveOriginalDestination,
-				dispatcher:   h.mux,
+				tag:             tag,
+				proxy:           p,
+				address:         address,
+				port:            net.Port(port),
+				recvOrigDest:    receiverConfig.ReceiveOriginalDestination,
+				dispatcher:      h.mux,
+				uplinkCounter:   uplinkCounter,
+				downlinkCounter: downlinkCounter,
 			}
 			h.workers = append(h.workers, worker)
 		}
@@ -72,6 +104,7 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 	return h, nil
 }
 
+// Start implements common.Runnable.
 func (h *AlwaysOnInboundHandler) Start() error {
 	for _, worker := range h.workers {
 		if err := worker.Start(); err != nil {
@@ -81,11 +114,20 @@ func (h *AlwaysOnInboundHandler) Start() error {
 	return nil
 }
 
+// Close implements common.Closable.
 func (h *AlwaysOnInboundHandler) Close() error {
+	var errors []interface{}
 	for _, worker := range h.workers {
-		worker.Close()
+		if err := worker.Close(); err != nil {
+			errors = append(errors, err)
+		}
 	}
-	h.mux.Close()
+	if err := h.mux.Close(); err != nil {
+		errors = append(errors, err)
+	}
+	if len(errors) > 0 {
+		return newError("failed to close all resources").Base(newError(serial.Concat(errors...)))
+	}
 	return nil
 }
 
